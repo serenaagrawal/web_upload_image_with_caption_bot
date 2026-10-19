@@ -1,15 +1,19 @@
 # web_upload.py  (Railway version - NOW STREAMING poster)
 #
 # Env in Railway > Variables:
-#   API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID, KEY, PORT (auto)
+#   API_ID, API_HASH, BOT_TOKEN
+#   CHANNEL_ID = single channel (e.g. -1001234567890 or @cinepopx)
+#   CHANNELS   = multiple channels comma separated (e.g. -1001111,-1002222,@cinepopx)
+#   CHANNEL_NAMES = optional labels comma separated (e.g. CinePopX,Hub)
+#   KEY, PORT (auto)
 #
 # Open: https://<your-railway-domain>/?key=<KEY>
-import asyncio, html, os, re, secrets, shutil, sys
+import asyncio, html, os, re, secrets, sys
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
@@ -19,7 +23,7 @@ WAIT_FOR_POST = 300
 TMP_DIR = Path("/tmp/web_tmp")
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-STATE = {"client": None, "target": None, "token": ""}
+STATE = {"client": None, "target": None, "targets": [], "target_map": {}, "token": ""}
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -35,8 +39,9 @@ PAGE = r"""<!doctype html>
   .card{background:var(--card);border-radius:20px;padding:22px;box-shadow: 10px 10px 20px var(--shadow-dark), -10px -10px 20px var(--shadow-light);margin-bottom:20px}
   label{font-size:12px;color:var(--muted);letter-spacing:.5px;margin:14px 0 6px;display:block}
   label:first-child{margin-top:0}
-  input,textarea{width:100%;background:var(--card);border:none;outline:none;color:var(--text);padding:12px 14px;border-radius:12px;box-shadow: inset 5px 5px 10px var(--inset-dark), inset -5px -5px 10px var(--inset-light);font-size:14px;font-family:inherit}
+  input,textarea,select{width:100%;background:var(--card);border:none;outline:none;color:var(--text);padding:12px 14px;border-radius:12px;box-shadow: inset 5px 5px 10px var(--inset-dark), inset -5px -5px 10px var(--inset-light);font-size:14px;font-family:inherit}
   textarea{resize:vertical;min-height:80px}
+  select{cursor:pointer}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   @media(max-width:600px){.grid2{grid-template-columns:1fr}}
   .filebox{border-radius:12px;padding:20px;text-align:center;cursor:pointer;box-shadow: inset 5px 5px 10px var(--inset-dark), inset -5px -5px 10px var(--inset-light);border:2px dashed #2e3444}
@@ -54,8 +59,11 @@ PAGE = r"""<!doctype html>
 <p class="sub">Neumorphism Poster • Image + Exact Caption Format</p>
 
 <div class="card">
+  <label>Post to Channel *</label>
+  <select id="channel">__CHANNEL_OPTIONS__</select>
+
   <label>Poster Image (required)</label>
-  <div id="drop" class="filebox">Tap or drop image here<br><small>JPG, PNG, WEBP - will be used as post photo</small><input id="file" type="file" accept="image/*" hidden></div>
+  <div id="drop" class="filebox">Tap or drop image here<br><small>JPG, PNG, WEBP - sent as-is for best clarity</small><input id="file" type="file" accept="image/*" hidden></div>
   <img id="previewImg">
 
   <label>Movie Title *</label>
@@ -150,7 +158,6 @@ function buildCaption(){
   const links=v('links').split('\n').map(s=>s.trim()).filter(Boolean);
   let tags=v('tags').split(/\s+/).filter(Boolean).map(t=>t.startsWith('#')?t:'#'+t.replace(/^#+/,'')).join(' ');
   const bottom=v('bottom');
-
   let out=[head];
   if(tagline) out.push(tagline);
   if(desc) out.push(desc);
@@ -181,11 +188,13 @@ btn.onclick=async()=>{
   btn.disabled=true; status.textContent='Posting...'; status.className='status';
   const fd=new FormData();
   fd.append('image', chosenFile);
+  fd.append('channel', $('channel').value);
   ['title','year','studio','tagline','desc','quality','rating','votes','stars','director','writers','channels','links','tags','bottom'].forEach(id=>fd.append(id, $(id).value));
   try{
     const r=await fetch('/?key='+encodeURIComponent(KEY),{method:'POST',body:fd});
-    const j=await r.json();
-    if(!r.ok) throw new Error(j.detail||'Failed');
+    const text = await r.text();
+    let j={}; try{ j=JSON.parse(text); } catch{ throw new Error(text.slice(0,400) || 'Server error'); }
+    if(!r.ok) throw new Error(j.detail||text.slice(0,400));
     status.textContent='✅ Posted to channel!'; status.className='status ok';
   }catch(e){ status.textContent='❌ '+e.message; status.className='status err'; }
   btn.disabled=false;
@@ -215,28 +224,33 @@ def build_caption_from_form(data: dict) -> str:
     tags_raw = data.get("tags","").strip()
     bottom = data.get("bottom","").strip()
 
-    head = f"🎬 NOW STREAMING 🎬\n{e(title)}" + (f" ({e(year)})" if year else "") + (f" | {e(studio)} Original" if studio else "")
-    lines = [head]
-    if tagline: lines.append(e(tagline))
+    # FIX 1: Bold exactly like screenshot
+    title_line = f'<b>{e(title.upper())}</b>' + (f' <b>({e(year)})</b>' if year else '') + (f' | <b>{e(studio)} Original</b>' if studio else '')
+    lines = [f'🎬 <b>NOW STREAMING</b> 🎬', title_line]
+
+    if tagline: lines.append(f'<b>{e(tagline)}</b>')
     if desc: lines.append(e(desc))
-    if quality: lines.append(f"🎥 {e(quality)}")
-    if rating: lines.append(f"⭐️ Rating: {e(rating)}" + (f" ({e(votes)} votes)" if votes else ""))
+    if quality: lines.append(f'🎥 <b>{e(quality)}</b>')
+    if rating: lines.append(f'⭐️ <b>Rating:</b> {e(rating)}' + (f' ({e(votes)} votes)' if votes else ''))
     if stars_raw:
         stars = " · ".join([s.strip() for s in re.split(r"[,·]+", stars_raw) if s.strip()])
-        if stars: lines.append(f"👥 Stars: {e(stars)}")
-    if director: lines.append(f"🎬 Director: {e(director)}")
+        if stars: lines.append(f'👥 <b>Stars:</b> {e(stars)}')
+    if director: lines.append(f'🎬 <b>Director:</b> {e(director)}')
     if writers_raw:
         writers = " · ".join([s.strip() for s in writers_raw.split(",") if s.strip()])
-        if writers: lines.append(f"✍️ Writers: {e(writers)}")
+        if writers: lines.append(f'✍️ <b>Writers:</b> {e(writers)}')
+    
     channels = [c.strip() for c in channels_raw.splitlines() if c.strip()]
     if channels:
-        lines.append("📥 WATCH HERE:")
+        lines.append('📥 <b>WATCH HERE:</b>')
         lines.extend(e(c) for c in channels)
+    
     links = [l.strip() for l in links_raw.splitlines() if l.strip()]
     if links:
-        lines.append("🔗 Link:")
+        lines.append('🔗 <b>Link:</b>')
         for i,l in enumerate(links,1):
-            lines.append(f"{i}. {e(l)}")
+            lines.append(f'{i}. {e(l)}')
+    
     if tags_raw:
         tags = []
         for t in tags_raw.split():
@@ -244,56 +258,84 @@ def build_caption_from_form(data: dict) -> str:
             if not t: continue
             if not t.startswith("#"): t="#"+t.lstrip("#")
             tags.append(e(t))
-        if tags: lines.append("\n" + " ".join(tags))
-    if bottom: lines.append(e(bottom))
+        if tags: lines.append('\n' + " ".join(tags))
+    
+    if bottom: lines.append(f'<i>{e(bottom)}</i>')
 
     caption = "\n".join(lines)
-    # Telegram limit 1024 chars
-    if len(caption) > 1024:
+    # Telegram caption limit 1024 chars - truncate HTML safely before sending
+    # plain text length check
+    plain = re.sub(r"<[^>]+>", "", html.unescape(caption))
+    if len(plain) > 1024:
         caption = caption[:1021] + "…"
     return caption
 
 @app.get("/", response_class=HTMLResponse)
 async def index(key: str = ""):
     check(key)
-    return PAGE.replace("__KEY__", key)
+    # build channel options for UI
+    opts = ""
+    for idx, label in enumerate(STATE["target_map"].keys()):
+        opts += f'<option value="{idx}">{html.escape(label)}</option>'
+    if not opts:
+        opts = '<option value="0">Default Channel</option>'
+    return PAGE.replace("__KEY__", key).replace("__CHANNEL_OPTIONS__", opts)
 
 @app.post("/")
 async def post_image(request: Request, key: str = ""):
-    check(key)
-    form = await request.form()
-    image: UploadFile = form.get("image")
-    if not image or not image.filename:
-        raise HTTPException(status_code=400, detail="image required")
-    data = {k: (form.get(k) or "") for k in ["title","year","studio","tagline","desc","quality","rating","votes","stars","director","writers","channels","links","tags","bottom"]}
-    if not data["title"].strip():
-        raise HTTPException(status_code=400, detail="title required")
-
-    caption = build_caption_from_form(data)
-    tmp = TMP_DIR / f"poster_{secrets.token_hex(4)}{Path(image.filename).suffix or '.jpg'}"
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-    content = await image.read()
-    if len(content) > 10*1024*1024:
-        raise HTTPException(status_code=400, detail="image too large (max 10MB)")
-    tmp.write_bytes(content)
-
-    client, target = STATE["client"], STATE["target"]
     try:
-        for attempt in range(5):
-            try:
-                await client.send_file(target, str(tmp), caption=caption, parse_mode="html")
-                break
-            except FloodWaitError as e:
-                await asyncio.sleep(e.seconds + 1)
-            except (ConnectionError, OSError, asyncio.TimeoutError):
-                await asyncio.sleep(5*(attempt+1))
-        else:
-            raise HTTPException(status_code=500, detail="failed after retries")
-    finally:
-        tmp.unlink(missing_ok=True)
-    return {"ok": True}
+        check(key)
+        form = await request.form()
+        image: UploadFile = form.get("image")
+        if not image or not image.filename:
+            raise HTTPException(status_code=400, detail="image required")
+        data = {k: str(form.get(k) or "") for k in ["title","year","studio","tagline","desc","quality","rating","votes","stars","director","writers","channels","links","tags","bottom"]}
+        if not data["title"].strip():
+            raise HTTPException(status_code=400, detail="title required")
 
-# --- Telegram startup (same as before, without Gemini) ---
+        # FIX 3: pick channel without restarting bot
+        ch_idx = 0
+        try:
+            ch_idx = int(str(form.get("channel") or "0"))
+        except: pass
+        if STATE["targets"] and 0 <= ch_idx < len(STATE["targets"]):
+            target = STATE["targets"][ch_idx]
+        else:
+            target = STATE["target"]
+
+        caption = build_caption_from_form(data)
+        tmp = TMP_DIR / f"poster_{secrets.token_hex(4)}{Path(image.filename).suffix or '.jpg'}"
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        content = await image.read()
+        if len(content) > 10*1024*1024:
+            raise HTTPException(status_code=400, detail="image too large (max 10MB)")
+        if len(content) < 10*1024:
+            raise HTTPException(status_code=400, detail="image file is corrupted or too small")
+        tmp.write_bytes(content)
+
+        client = STATE["client"]
+        try:
+            for attempt in range(5):
+                try:
+                    # FIX 2: send original bytes as photo, high quality (no recompression)
+                    await client.send_file(target, str(tmp), caption=caption, parse_mode="html", force_document=False)
+                    break
+                except FloodWaitError as e:
+                    await asyncio.sleep(e.seconds + 1)
+                except (ConnectionError, OSError, asyncio.TimeoutError):
+                    await asyncio.sleep(5*(attempt+1))
+            else:
+                raise HTTPException(status_code=500, detail="failed after 5 retries")
+        finally:
+            tmp.unlink(missing_ok=True)
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as ex:
+        import traceback; traceback.print_exc()
+        return JSONResponse(status_code=500, content={"detail": str(ex)[:400]})
+
+# --- Telegram startup ---
 async def resolve_channel(client, channel):
     try: return await client.get_input_entity(channel)
     except Exception: pass
@@ -314,23 +356,43 @@ def need(name: str) -> str:
     if not v: sys.exit(f"Missing environment variable: {name}")
     return v
 
+def parse_channels():
+    # CHANNELS takes priority, fallback to CHANNEL_ID
+    raw = os.environ.get("CHANNELS","").strip() or os.environ.get("CHANNEL_ID","").strip()
+    if not raw:
+        sys.exit("Missing CHANNEL_ID or CHANNELS")
+    names_raw = os.environ.get("CHANNEL_NAMES","").strip()
+    labels = [n.strip() for n in names_raw.split(",")] if names_raw else []
+    ch_map = {}
+    for i, ch in enumerate([c.strip() for c in raw.split(",") if c.strip()]):
+        cid = int(ch) if re.fullmatch(r"-?\d+", ch) else ch
+        label = labels[i] if i < len(labels) and labels[i] else ch
+        ch_map[label] = cid
+    return ch_map
+
 async def main():
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     api_id = int(need("API_ID")); api_hash = need("API_HASH")
-    bot_tok = need("BOT_TOKEN"); raw_ch = need("CHANNEL_ID")
-    channel = int(raw_ch) if re.fullmatch(r"-?\d+", raw_ch) else raw_ch
+    bot_tok = need("BOT_TOKEN")
+    ch_map = parse_channels()
     key = os.environ.get("KEY","").strip() or secrets.token_urlsafe(16)
     client = TelegramClient(StringSession(), api_id, api_hash)
     await client.start(bot_token=bot_tok)
-    target = await resolve_channel(client, channel)
-    if target is None:
-        print("Channel not found. Make bot admin and check ID (-100...).", flush=True)
-        await client.disconnect(); sys.exit(1)
-    print("Channel found.", flush=True)
-    STATE.update(client=client, target=target, token=key)
+
+    targets = []
+    for label, cid in ch_map.items():
+        t = await resolve_channel(client, cid)
+        if t is None:
+            print(f"Channel not found: {label} ({cid}) - make bot admin.", flush=True)
+            await client.disconnect(); sys.exit(1)
+        targets.append(t)
+        print(f"Channel OK: {label}", flush=True)
+
+    STATE.update(client=client, target=targets[0], targets=targets, target_map=ch_map, token=key)
     domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN","")
     print("="*60, flush=True)
     print(f"Open: https://{domain}/?key={key}" if domain else f"Open: https://<your-domain>/?key={key}", flush=True)
+    print(f"Channels: {', '.join(ch_map.keys())}", flush=True)
     print("="*60, flush=True)
     server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="warning"))
     try: await server.serve()
