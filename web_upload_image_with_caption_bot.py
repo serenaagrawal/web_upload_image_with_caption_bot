@@ -63,7 +63,7 @@ PAGE = r"""<!doctype html>
   <select id="channel">__CHANNEL_OPTIONS__</select>
 
   <label>Poster Image (required)</label>
-  <div id="drop" class="filebox">Tap or drop image here<br><small>JPG, PNG, WEBP - sent as-is for best clarity</small><input id="file" type="file" accept="image/*" hidden></div>
+  <div id="drop" class="filebox">Tap or drop image here<br><small>JPG, PNG, WEBP - sent in original 4K quality</small><input id="file" type="file" accept="image/*" hidden></div>
   <img id="previewImg">
 
   <label>Movie Title *</label>
@@ -182,6 +182,32 @@ function update(){ preview.textContent=buildCaption(); }
 els.forEach(e=>e.addEventListener('input',update));
 update();
 
+function clearForm(){
+  // FIX 1: clear all text fields after successful post
+  $('title').value='';
+  $('year').value='';
+  $('studio').value='';
+  $('tagline').value='';
+  $('desc').value='';
+  $('quality').value='HD | FULL MOVIE | EP 1/1';
+  $('rating').value='';
+  $('votes').value='';
+  $('stars').value='';
+  $('director').value='';
+  $('writers').value='';
+  $('links').value='';
+  $('tags').value='';
+  $('bottom').value='';
+  // keep @cinepopx default for convenience - clear if you want blank: set to ''
+  // $('channels').value='';
+  chosenFile=null;
+  fileIn.value='';
+  img.style.display='none';
+  img.src='';
+  drop.innerHTML=`Tap or drop image here<br><small>JPG, PNG, WEBP - sent in original 4K quality</small>`;
+  update();
+}
+
 btn.onclick=async()=>{
   if(!chosenFile){ status.textContent='Please select an image'; status.className='status err'; return; }
   if(!$('title').value.trim()){ status.textContent='Title is required'; status.className='status err'; return; }
@@ -196,6 +222,7 @@ btn.onclick=async()=>{
     let j={}; try{ j=JSON.parse(text); } catch{ throw new Error(text.slice(0,400) || 'Server error'); }
     if(!r.ok) throw new Error(j.detail||text.slice(0,400));
     status.textContent='✅ Posted to channel!'; status.className='status ok';
+    clearForm();
   }catch(e){ status.textContent='❌ '+e.message; status.className='status err'; }
   btn.disabled=false;
 }
@@ -224,7 +251,6 @@ def build_caption_from_form(data: dict) -> str:
     tags_raw = data.get("tags","").strip()
     bottom = data.get("bottom","").strip()
 
-    # FIX 1: Bold exactly like screenshot
     title_line = f'<b>{e(title.upper())}</b>' + (f' <b>({e(year)})</b>' if year else '') + (f' | <b>{e(studio)} Original</b>' if studio else '')
     lines = [f'🎬 <b>NOW STREAMING</b> 🎬', title_line]
 
@@ -263,8 +289,6 @@ def build_caption_from_form(data: dict) -> str:
     if bottom: lines.append(f'<i>{e(bottom)}</i>')
 
     caption = "\n".join(lines)
-    # Telegram caption limit 1024 chars - truncate HTML safely before sending
-    # plain text length check
     plain = re.sub(r"<[^>]+>", "", html.unescape(caption))
     if len(plain) > 1024:
         caption = caption[:1021] + "…"
@@ -273,7 +297,6 @@ def build_caption_from_form(data: dict) -> str:
 @app.get("/", response_class=HTMLResponse)
 async def index(key: str = ""):
     check(key)
-    # build channel options for UI
     opts = ""
     for idx, label in enumerate(STATE["target_map"].keys()):
         opts += f'<option value="{idx}">{html.escape(label)}</option>'
@@ -293,7 +316,6 @@ async def post_image(request: Request, key: str = ""):
         if not data["title"].strip():
             raise HTTPException(status_code=400, detail="title required")
 
-        # FIX 3: pick channel without restarting bot
         ch_idx = 0
         try:
             ch_idx = int(str(form.get("channel") or "0"))
@@ -317,7 +339,8 @@ async def post_image(request: Request, key: str = ""):
         try:
             for attempt in range(5):
                 try:
-                    # FIX 2: send original bytes as photo, high quality (no recompression)
+                    # FIX 2: 4K - send original file bytes as PHOTO with no recompression
+                    # Telegram will keep the original 4K resolution. Do not use thumb.
                     await client.send_file(target, str(tmp), caption=caption, parse_mode="html", force_document=False)
                     break
                 except FloodWaitError as e:
@@ -357,7 +380,6 @@ def need(name: str) -> str:
     return v
 
 def parse_channels():
-    # CHANNELS takes priority, fallback to CHANNEL_ID
     raw = os.environ.get("CHANNELS","").strip() or os.environ.get("CHANNEL_ID","").strip()
     if not raw:
         sys.exit("Missing CHANNEL_ID or CHANNELS")
