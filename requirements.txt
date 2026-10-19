@@ -3,3 +3,4 @@ cryptg
 hachoir
 fastapi
 uvicorn
+python-multipart
